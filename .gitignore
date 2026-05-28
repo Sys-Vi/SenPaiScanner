@@ -1,6 +1,4 @@
 # Binaries
-senpaiscanner
-senpaiscanner.exe
 *.exe
 *.dll
 *.so
