@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -259,6 +260,7 @@ type menuEntry struct {
 
 var menuEntries = []menuEntry{
 	{"Find Working IPs", "scan Cloudflare IPs — config optional"},
+	{"Retry Last Scan", "retry last scan with previous configuration"},
 	{"About", ""},
 	{"Quit", ""},
 }
@@ -267,11 +269,107 @@ const menuLabelWidth = 16
 
 const (
 	menuFindWorking = 0
-	menuAbout       = 1
-	menuQuit        = 2
+	menuRetryLast   = 1
+	menuAbout       = 2
+	menuQuit        = 3
 )
 
 var modes = []string{"tls", "tcp", "http"}
+
+// SavedConfig represents the scan settings that can be persisted.
+type SavedConfig struct {
+	IPMode        int    `json:"ip_mode"`
+	CountIdx      int    `json:"count_idx"`
+	CountCustom   string `json:"count_custom"`
+	WorkersIdx    int    `json:"workers_idx"`
+	WorkersCustom string `json:"workers_custom"`
+	TimeoutIdx    int    `json:"timeout_idx"`
+	TimeoutCustom string `json:"timeout_custom"`
+	Ports         []int  `json:"ports"`
+	ConfigURL     string `json:"config_url"`
+	TopNIdx       int    `json:"top_n_idx"`
+	TopNCustom    string `json:"top_n_custom"`
+}
+
+// AppConfig wraps SavedConfig to allow for future settings.
+type AppConfig struct {
+	LastConfig SavedConfig `json:"last_config"`
+}
+
+var configPathOverride string
+
+func getConfigFilePath() string {
+	if configPathOverride != "" {
+		return configPathOverride
+	}
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "senpaiscanner-config.json"
+	}
+	appDir := filepath.Join(dir, "senpaiscanner")
+	_ = os.MkdirAll(appDir, 0755)
+	return filepath.Join(appDir, "config.json")
+}
+
+func loadAppConfig() AppConfig {
+	path := getConfigFilePath()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return defaultAppConfig()
+	}
+	var cfg AppConfig
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		return defaultAppConfig()
+	}
+	return cfg
+}
+
+func saveAppConfig(cfg AppConfig) error {
+	path := getConfigFilePath()
+	b, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0644)
+}
+
+func defaultAppConfig() AppConfig {
+	return AppConfig{
+		LastConfig: SavedConfig{
+			IPMode:        0, // Random
+			CountIdx:      1, // 5,000
+			CountCustom:   "",
+			WorkersIdx:    0, // 50
+			WorkersCustom: "",
+			TimeoutIdx:    2, // 5s
+			TimeoutCustom: "",
+			Ports:         nil,
+			ConfigURL:     "",
+			TopNIdx:       2, // 50
+			TopNCustom:    "",
+		},
+	}
+}
+
+func (m *AppModel) applySavedConfig(cfg SavedConfig) {
+	m.configIPMode = cfg.IPMode
+	m.configCountIdx = cfg.CountIdx
+	m.configCountCustom = cfg.CountCustom
+	m.configWorkersIdx = cfg.WorkersIdx
+	m.configWorkersCustom = cfg.WorkersCustom
+	m.configTimeoutIdx = cfg.TimeoutIdx
+	m.configTimeoutCustom = cfg.TimeoutCustom
+	m.configTopNIdx = cfg.TopNIdx
+	m.configTopNCustom = cfg.TopNCustom
+	m.configSelectedPorts = make(map[int]bool)
+	for _, port := range cfg.Ports {
+		m.configSelectedPorts[port] = true
+	}
+	if len(m.configSelectedPorts) == 0 {
+		m.configSelectedPorts[0] = true
+	}
+	m.configInput.SetValue(cfg.ConfigURL)
+}
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -296,8 +394,6 @@ func NewApp(version string) AppModel {
 		height:           40,
 		scanStarted:      time.Now(),
 		quickCustomInput: customInput,
-		configWorkersIdx: 0,
-		configTimeoutIdx: 2,
 	}
 
 	// Config input for "Scan with Config"
@@ -312,6 +408,10 @@ func NewApp(version string) AppModel {
 	cfgCustom.CharLimit = 10
 	cfgCustom.Width = 12
 	m.configCustomInput = cfgCustom
+
+	// Load configuration from file
+	appCfg := loadAppConfig()
+	m.applySavedConfig(appCfg.LastConfig)
 
 	m.modeIdx = modeIndex(m.scanCfg.Mode)
 	m.buildFormInputs()
@@ -543,25 +643,16 @@ func (m AppModel) selectMenuItem() (tea.Model, tea.Cmd) {
 	switch m.menuIdx {
 	case menuFindWorking:
 		m.page = PageScanWithConfig
-		m.configInput.SetValue("")
+		appCfg := loadAppConfig()
+		m.applySavedConfig(appCfg.LastConfig)
 		m.configInput.Blur()
 		m.configResults = nil
 		m.configScanning = false
 		m.configDone = false
 		m.configSetupRow = 0
 		m.configOptionalRow = 0
-		m.configCountIdx = 1   // default: 5,000
-		m.configTopNIdx = 2    // default: 50 for Phase 2
-		m.configWorkersIdx = 0 // default: 50 workers (restricted-net safe)
-		m.configTimeoutIdx = 2 // default: 5s
-		m.configIPMode = 0     // default: random Cloudflare IPs
 		m.configPortFocus = 0
-		m.configSelectedPorts = nil
 		m.configCustomMode = false
-		m.configCountCustom = ""
-		m.configWorkersCustom = ""
-		m.configTimeoutCustom = ""
-		m.configTopNCustom = ""
 		m.configCustomInput.SetValue("")
 		m.configCustomInput.Blur()
 		m.configURL = ""
@@ -570,6 +661,10 @@ func (m AppModel) selectMenuItem() (tea.Model, tea.Cmd) {
 		clearLiveResultWriter()
 		m.statusMsg = ""
 		return m, nil
+	case menuRetryLast:
+		appCfg := loadAppConfig()
+		m.applySavedConfig(appCfg.LastConfig)
+		return m.launchPhase1FromOptional()
 	case menuAbout:
 		m.page = PageAbout
 	case menuQuit:
@@ -1140,8 +1235,13 @@ func (m AppModel) viewHome() string {
 	sb.WriteString(art)
 	sb.WriteRune('\n')
 
-	// Version — keep newlines outside styled output; lipgloss pads blank lines with spaces.
-	sb.WriteString(styleDim.Render(fmt.Sprintf("  v%s", m.version)))
+	ver := m.version
+	if !strings.HasPrefix(strings.ToLower(ver), "v") {
+		ver = "v" + ver
+	}
+	sb.WriteString(styleDim.Render(fmt.Sprintf("  %s", ver)))
+	sb.WriteRune('\n')
+	sb.WriteString(styleDim.Render(fmt.Sprintf("  config: %s", getConfigFilePath())))
 	sb.WriteString("\n\n")
 
 	// Menu
@@ -1807,11 +1907,11 @@ func (m AppModel) viewScanWithConfig() string {
 		if m.configCustomMode && m.configCustomRow == 1 {
 			sb.WriteString(styleAccent.Render("            custom count: ") + m.configCustomInput.View() + "\n\n")
 		} else if configCountValues[m.configCountIdx] == 0 && m.configCountCustom != "" {
-			sb.WriteString(styleDim.Render(fmt.Sprintf("            IPs to probe in Phase 1  (custom: %s)", m.configCountCustom)) + "\n\n")
+			sb.WriteString(styleDim.Render(fmt.Sprintf("            caps the number of random Cloudflare IPs generated and scanned  (custom: %s)", m.configCountCustom)) + "\n\n")
 		} else if m.configIPMode == 1 {
-			sb.WriteString(styleDim.Render("            ignored when Source is From File — all IPs in ips.txt are used") + "\n\n")
+			sb.WriteString(styleDim.Render("            caps the number of custom IPs loaded from ips.txt") + "\n\n")
 		} else {
-			sb.WriteString(styleDim.Render("            IPs to probe in Phase 1") + "\n\n")
+			sb.WriteString(styleDim.Render("            caps the number of random Cloudflare IPs generated and scanned") + "\n\n")
 		}
 
 		// Row 2: Workers
@@ -2327,6 +2427,27 @@ func (m AppModel) launchPhase1FromOptional() (AppModel, tea.Cmd) {
 		}
 	}
 	m.configPhase1Total = m.phase1TargetTotal(count)
+
+	// Save the current config to disk
+	savedCfg := SavedConfig{
+		IPMode:        m.configIPMode,
+		CountIdx:      m.configCountIdx,
+		CountCustom:   m.configCountCustom,
+		WorkersIdx:    m.configWorkersIdx,
+		WorkersCustom: m.configWorkersCustom,
+		TimeoutIdx:    m.configTimeoutIdx,
+		TimeoutCustom: m.configTimeoutCustom,
+		ConfigURL:     rawURL,
+		TopNIdx:       m.configTopNIdx,
+		TopNCustom:    m.configTopNCustom,
+	}
+	for port, on := range m.configSelectedPorts {
+		if on {
+			savedCfg.Ports = append(savedCfg.Ports, port)
+		}
+	}
+	_ = saveAppConfig(AppConfig{LastConfig: savedCfg})
+
 	return m, m.startConfigPhase1()
 }
 
@@ -2768,7 +2889,11 @@ func (m AppModel) phase1TargetTotal(count int) int {
 	}
 	if m.configIPMode == 1 {
 		if ips, err := loadDefaultIPsFile(); err == nil {
-			return len(ips) * ports
+			numIPs := len(ips)
+			if numIPs > count {
+				numIPs = count
+			}
+			return numIPs * ports
 		}
 		return 0
 	}

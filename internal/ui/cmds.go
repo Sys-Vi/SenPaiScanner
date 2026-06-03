@@ -3,7 +3,9 @@ package ui
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
@@ -320,6 +322,9 @@ func runConfigPhase1(opts configPhase1Options) {
 			}
 			return
 		}
+		if len(ips) > opts.count {
+			ips = ips[:opts.count]
+		}
 		ch := make(chan net.IP, len(ips))
 		for _, ip := range ips {
 			ch <- ip
@@ -614,11 +619,81 @@ func loadIPs(path string) ([]net.IP, error) {
 			continue
 		}
 		field := strings.SplitN(line, ",", 2)[0]
-		if ip := net.ParseIP(strings.TrimSpace(field)); ip != nil {
-			ips = append(ips, ip)
+		field = strings.TrimSpace(field)
+		if ip := net.ParseIP(field); ip != nil {
+			if ip.To4() != nil {
+				ips = append(ips, ip)
+			}
+		} else if strings.Contains(field, "/") {
+			_, ipNet, err := net.ParseCIDR(field)
+			if err == nil {
+				if ipNet.IP.To4() != nil {
+					ips = append(ips, sampleFromSubnet(ipNet, 256)...)
+				}
+			} else {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", field, err)
+			}
 		}
 	}
 	return ips, sc.Err()
+}
+
+func sampleFromSubnet(ipNet *net.IPNet, count int) []net.IP {
+	ip4 := ipNet.IP.To4()
+	if ip4 == nil {
+		return nil
+	}
+
+	ones, bits := ipNet.Mask.Size()
+	hostBits := bits - ones
+
+	// If the subnet contains <= count IPs, expand it fully.
+	// For IPv4, hostBits <= 8 (e.g. /24 and smaller) means <= 256 IPs.
+	if hostBits <= 8 {
+		var ips []net.IP
+		for ip := cloneIP(ipNet.IP); ipNet.Contains(ip); incrementIP(ip) {
+			if ip.To4() != nil {
+				ips = append(ips, cloneIP(ip))
+			}
+		}
+		return ips
+	}
+
+	// Otherwise, randomly sample unique IPs
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	base := binary.BigEndian.Uint32(ip4)
+	mask := binary.BigEndian.Uint32([]byte(ipNet.Mask))
+	size := ^mask
+
+	seen := make(map[uint32]struct{})
+	var ips []net.IP
+	// Try up to count * 3 times to avoid infinite loop
+	for i := 0; i < count*3 && len(ips) < count; i++ {
+		offset := rng.Uint32() & size
+		if _, ok := seen[offset]; ok {
+			continue
+		}
+		seen[offset] = struct{}{}
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, base|offset)
+		ips = append(ips, ip)
+	}
+	return ips
+}
+
+func cloneIP(ip net.IP) net.IP {
+	dup := make(net.IP, len(ip))
+	copy(dup, ip)
+	return dup
+}
+
+func incrementIP(ip net.IP) {
+	for i := len(ip) - 1; i >= 0; i-- {
+		ip[i]++
+		if ip[i] != 0 {
+			break
+		}
+	}
 }
 
 func speedSampleForMode(mode prober.Mode) int64 {

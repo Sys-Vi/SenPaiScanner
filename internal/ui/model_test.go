@@ -18,12 +18,23 @@ import (
 
 var ansiRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 
+func newTestApp(t *testing.T) AppModel {
+	configPathOverride = filepath.Join(t.TempDir(), "config.json")
+	t.Cleanup(func() {
+		configPathOverride = ""
+	})
+	return NewApp("test")
+}
+
 func TestMenuOnlyShowsMainWorkflow(t *testing.T) {
-	if len(menuEntries) != 3 {
-		t.Fatalf("menu entries = %d, want 3", len(menuEntries))
+	if len(menuEntries) != 4 {
+		t.Fatalf("menu entries = %d, want 4", len(menuEntries))
 	}
 	if menuEntries[0].label != "Find Working IPs" {
 		t.Fatalf("first menu item = %q, want Find Working IPs", menuEntries[0].label)
+	}
+	if menuEntries[1].label != "Retry Last Scan" {
+		t.Fatalf("second menu item = %q, want Retry Last Scan", menuEntries[1].label)
 	}
 	for _, entry := range menuEntries {
 		for _, removed := range []string{"Quick Scan", "Custom Scan", "Test IPs", "Discover Colos"} {
@@ -35,7 +46,7 @@ func TestMenuOnlyShowsMainWorkflow(t *testing.T) {
 }
 
 func TestResolvePhase1OptionsUsesRandomCloudflareDefaults(t *testing.T) {
-	m := NewApp("test")
+	m := newTestApp(t)
 	m.configURL = "vless://12345678-1234-1234-1234-123456789abc@example.com:443?encryption=none&security=tls&type=ws&host=example.com&path=%2F#test"
 	m.configCountIdx = 1
 
@@ -58,7 +69,7 @@ func TestResolvePhase1OptionsUsesRandomCloudflareDefaults(t *testing.T) {
 }
 
 func TestResolvePhase1OptionsFromFile(t *testing.T) {
-	m := NewApp("test")
+	m := newTestApp(t)
 	m.configIPMode = 1
 	opts := m.resolvePhase1Options()
 	if !opts.fromFile {
@@ -67,7 +78,7 @@ func TestResolvePhase1OptionsFromFile(t *testing.T) {
 }
 
 func TestResolveConfigPortsMultiSelect(t *testing.T) {
-	m := NewApp("test")
+	m := newTestApp(t)
 	m.configURL = "vless://12345678-1234-1234-1234-123456789abc@example.com:443?encryption=none&security=tls&type=ws&host=example.com&path=%2F#test"
 	m.configSelectedPorts = map[int]bool{443: true, 8443: true}
 
@@ -83,7 +94,7 @@ func TestResolveConfigPortsMultiSelect(t *testing.T) {
 }
 
 func TestConfigPhase1TableColumnsStayAligned(t *testing.T) {
-	m := NewApp("test")
+	m := newTestApp(t)
 	m.page = PageConfigPhase1
 	m.width = 120
 	m.configPhase1Total = 1000
@@ -238,5 +249,209 @@ func TestGenericScanCopyDoesNotExportHealthyIPs(t *testing.T) {
 	got := next.(AppModel).statusMsg
 	if !strings.Contains(got, "Find Working IPs") {
 		t.Fatalf("generic copy message = %q", got)
+	}
+}
+
+func TestLoadIPsSubnets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ips.txt")
+
+	// Test inputs
+	lines := []string{
+		"# Comment line",
+		"10.0.0.1",       // IPv4 plain
+		"2001:db8::1",    // IPv6 plain (should be ignored)
+		"10.0.0.8/30",    // IPv4 small subnet (4 IPs: 10.0.0.8, 10.0.0.9, 10.0.0.10, 10.0.0.11)
+		"2001:db8::/120", // IPv6 subnet (should be ignored)
+		"192.168.0.0/16", // IPv4 large subnet (> 256 IPs, should sample exactly 256 IPs)
+		"invalid-line",   // Should be ignored
+		"10.0.0.0/99",    // Invalid CIDR (should return error)
+	}
+
+	// First, test with valid lines (excluding the invalid CIDR)
+	if err := writeIPsFile(path, lines[:len(lines)-1]); err != nil {
+		t.Fatal(err)
+	}
+
+	ips, err := loadIPs(path)
+	if err != nil {
+		t.Fatalf("loadIPs failed: %v", err)
+	}
+
+	// Verify plain IPv4 was loaded
+	foundPlain := false
+	for _, ip := range ips {
+		if ip.String() == "10.0.0.1" {
+			foundPlain = true
+			break
+		}
+	}
+	if !foundPlain {
+		t.Error("expected to find 10.0.0.1 in loaded IPs")
+	}
+
+	// Verify IPv6 is completely ignored
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			t.Errorf("found IPv6 address %s, but IPv6 is not supported", ip.String())
+		}
+	}
+
+	// Verify 10.0.0.8/30 subnet was fully expanded (4 IPs)
+	subnetIPs := map[string]bool{
+		"10.0.0.8":  false,
+		"10.0.0.9":  false,
+		"10.0.0.10": false,
+		"10.0.0.11": false,
+	}
+	for _, ip := range ips {
+		if _, ok := subnetIPs[ip.String()]; ok {
+			subnetIPs[ip.String()] = true
+		}
+	}
+	for ip, found := range subnetIPs {
+		if !found {
+			t.Errorf("expected to find subnet IP %s", ip)
+		}
+	}
+
+	// Verify 192.168.0.0/16 large subnet was sampled (exactly 256 unique IPs within range)
+	sampledCount := 0
+	_, sampledNet, err := net.ParseCIDR("192.168.0.0/16")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sampledIPs := make(map[string]bool)
+	for _, ip := range ips {
+		if sampledNet.Contains(ip) {
+			sampledCount++
+			sampledIPs[ip.String()] = true
+		}
+	}
+	if sampledCount != 256 {
+		t.Errorf("expected exactly 256 sampled IPs from 192.168.0.0/16, got %d", sampledCount)
+	}
+	if len(sampledIPs) != 256 {
+		t.Errorf("expected 256 unique sampled IPs, got %d", len(sampledIPs))
+	}
+
+	// Verify invalid CIDR block returns an error
+	if err := writeIPsFile(path, lines); err != nil {
+		t.Fatal(err)
+	}
+	_, err = loadIPs(path)
+	if err == nil {
+		t.Error("expected error when loading invalid CIDR, but got nil")
+	}
+}
+
+func TestAppConfigPersistence(t *testing.T) {
+	tempDir := t.TempDir()
+
+	oldAppData := os.Getenv("APPDATA")
+	oldHome := os.Getenv("HOME")
+	t.Cleanup(func() {
+		os.Setenv("APPDATA", oldAppData)
+		os.Setenv("HOME", oldHome)
+	})
+
+	os.Setenv("APPDATA", tempDir)
+	os.Setenv("HOME", tempDir)
+
+	// Ensure config file doesn't exist initially
+	path := getConfigFilePath()
+	_ = os.Remove(path)
+
+	// Loading should fall back to default config
+	cfg := loadAppConfig()
+	if cfg.LastConfig.CountIdx != 1 {
+		t.Errorf("expected default CountIdx to be 1, got %d", cfg.LastConfig.CountIdx)
+	}
+
+	// Save custom config
+	custom := AppConfig{
+		LastConfig: SavedConfig{
+			IPMode:        1,
+			CountIdx:      3,
+			CountCustom:   "9999",
+			WorkersIdx:    2,
+			WorkersCustom: "111",
+			TimeoutIdx:    1,
+			TimeoutCustom: "4s",
+			Ports:         []int{8443, 2053},
+			ConfigURL:     "vless://test-url",
+			TopNIdx:       1,
+			TopNCustom:    "5",
+		},
+	}
+
+	if err := saveAppConfig(custom); err != nil {
+		t.Fatalf("saveAppConfig failed: %v", err)
+	}
+
+	// Verify loaded config matches custom config
+	loaded := loadAppConfig()
+	if loaded.LastConfig.IPMode != 1 || loaded.LastConfig.CountCustom != "9999" || loaded.LastConfig.ConfigURL != "vless://test-url" {
+		t.Errorf("loaded config does not match custom config: %+v", loaded.LastConfig)
+	}
+
+	// Verify applying saved config to model
+	m := newTestApp(t)
+	m.applySavedConfig(loaded.LastConfig)
+
+	if m.configIPMode != 1 || m.configCountCustom != "9999" || m.configInput.Value() != "vless://test-url" {
+		t.Errorf("model fields do not match applied saved config")
+	}
+
+	if !m.configSelectedPorts[8443] || !m.configSelectedPorts[2053] {
+		t.Errorf("model configSelectedPorts does not match applied saved config: %v", m.configSelectedPorts)
+	}
+}
+
+func TestVersionFormatting(t *testing.T) {
+	m1 := AppModel{version: "v0.5.0-dirty"}
+	view1 := m1.viewHome()
+	if strings.Contains(view1, "vv0.5.0") {
+		t.Error("home view contains double 'v' version prefix")
+	}
+	if !strings.Contains(view1, "  v0.5.0-dirty") {
+		t.Errorf("home view does not contain expected version, view: %s", view1)
+	}
+
+	m2 := AppModel{version: "0.5.0"}
+	view2 := m2.viewHome()
+	if !strings.Contains(view2, "  v0.5.0") {
+		t.Errorf("home view does not prepended version with 'v', view: %s", view2)
+	}
+}
+
+func TestPhase1TargetTotalEnforcesCountLimit(t *testing.T) {
+	dir := t.TempDir()
+	oldWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWD) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	ips := []string{"10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6", "10.0.0.7", "10.0.0.8", "10.0.0.9", "10.0.0.10"}
+	if err := writeIPsFile(filepath.Join(dir, "ips.txt"), ips); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newTestApp(t)
+	m.configIPMode = 1 // From File
+	m.configSelectedPorts = map[int]bool{443: true}
+
+	total := m.phase1TargetTotal(5)
+	if total != 5 {
+		t.Errorf("expected target total to be capped at 5, got %d", total)
+	}
+
+	total = m.phase1TargetTotal(20)
+	if total != 10 {
+		t.Errorf("expected target total to be 10, got %d", total)
 	}
 }
