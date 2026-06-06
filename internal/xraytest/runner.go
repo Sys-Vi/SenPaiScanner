@@ -508,7 +508,7 @@ func speedBudget(total, spent time.Duration) time.Duration {
 }
 
 func measureProxySpeed(ctx context.Context, proxyAddr string, cfg *VLESSConfig) (int64, float64) {
-	samples := []int64{speedSampleBytes, speedSampleBytesFast}
+	samples := []int64{int64(speedSampleBytes), int64(speedSampleBytesFast)}
 	if cfg != nil && cfg.SpeedSize > 0 {
 		samples = []int64{cfg.SpeedSize}
 	}
@@ -521,7 +521,7 @@ func measureProxySpeed(ctx context.Context, proxyAddr string, cfg *VLESSConfig) 
 		}
 	}
 
-	burstBytes := speedSampleBytesFast
+	burstBytes := int64(speedSampleBytesFast)
 	if cfg != nil && cfg.SpeedSize > 0 {
 		burstBytes = cfg.SpeedSize
 	}
