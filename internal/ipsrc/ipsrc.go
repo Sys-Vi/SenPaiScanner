@@ -6,9 +6,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -28,9 +30,11 @@ const (
 
 // Source holds the CIDR ranges used for IP generation.
 type Source struct {
-	v4Nets []*net.IPNet
-	v6Nets []*net.IPNet
-	rng    *rand.Rand
+	v4Nets     []*net.IPNet
+	v6Nets     []*net.IPNet
+	v4CumSizes []int64
+	v6CumSizes []float64
+	rng        *rand.Rand
 }
 
 // Options controls how a Source is built.
@@ -86,6 +90,29 @@ func NewWithOptions(useV4, useV6 bool, extra []string, opts Options) (*Source, e
 		return nil, fmt.Errorf("no IP ranges available (enable --v4 and/or --v6)")
 	}
 
+	// Calculate cumulative sizes for weighted random selection
+	if len(s.v4Nets) > 0 {
+		s.v4CumSizes = make([]int64, len(s.v4Nets))
+		var sum int64
+		for i, n := range s.v4Nets {
+			ones, bits := n.Mask.Size()
+			size := int64(1) << (bits - ones)
+			sum += size
+			s.v4CumSizes[i] = sum
+		}
+	}
+
+	if len(s.v6Nets) > 0 {
+		s.v6CumSizes = make([]float64, len(s.v6Nets))
+		var sum float64
+		for i, n := range s.v6Nets {
+			ones, bits := n.Mask.Size()
+			size := math.Exp2(float64(bits - ones))
+			sum += size
+			s.v6CumSizes[i] = sum
+		}
+	}
+
 	return s, nil
 }
 
@@ -96,8 +123,42 @@ func (s *Source) IPv4Nets() []*net.IPNet {
 
 // Random returns a single random IP from the configured ranges.
 func (s *Source) Random() net.IP {
-	all := append(s.v4Nets, s.v6Nets...)
-	target := all[s.rng.Intn(len(all))]
+	var target *net.IPNet
+	useV6 := false
+
+	if len(s.v4Nets) > 0 && len(s.v6Nets) > 0 {
+		// Both v4 and v6 are active. Pick between them.
+		// To match the original behavior's balance, we choose proportional to the number of subnets.
+		totalSubnets := len(s.v4Nets) + len(s.v6Nets)
+		if s.rng.Intn(totalSubnets) >= len(s.v4Nets) {
+			useV6 = true
+		}
+	} else if len(s.v6Nets) > 0 {
+		useV6 = true
+	}
+
+	if useV6 {
+		totalWeight := s.v6CumSizes[len(s.v6CumSizes)-1]
+		r := s.rng.Float64() * totalWeight
+		idx := sort.Search(len(s.v6CumSizes), func(i int) bool {
+			return s.v6CumSizes[i] >= r
+		})
+		if idx >= len(s.v6CumSizes) {
+			idx = len(s.v6CumSizes) - 1
+		}
+		target = s.v6Nets[idx]
+	} else {
+		totalSize := s.v4CumSizes[len(s.v4CumSizes)-1]
+		r := s.rng.Int63n(totalSize)
+		idx := sort.Search(len(s.v4CumSizes), func(i int) bool {
+			return s.v4CumSizes[i] > r
+		})
+		if idx >= len(s.v4CumSizes) {
+			idx = len(s.v4CumSizes) - 1
+		}
+		target = s.v4Nets[idx]
+	}
+
 	return randomFromNet(target, s.rng)
 }
 

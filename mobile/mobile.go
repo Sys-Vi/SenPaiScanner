@@ -229,8 +229,9 @@ func runScan(configJson string, callback Callback) {
 			}
 			return
 		}
-		ctx, _ := context.WithCancel(context.Background())
-		ipStream = src.Stream(ctx, count)
+		srcCtx, srcCancel := context.WithCancel(context.Background())
+		defer srcCancel()
+		ipStream = src.Stream(srcCtx, count)
 		neighborNets = src.IPv4Nets()
 	}
 
@@ -405,7 +406,7 @@ func runScan(configJson string, callback Callback) {
 	close(jobs)
 	wg.Wait()
 	close(results)
-	
+
 	// Drain remaining results
 	for r := range results {
 		pending--

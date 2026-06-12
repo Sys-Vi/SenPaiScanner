@@ -130,7 +130,7 @@ func runScan(cfg ScanConfig, scanID int64) {
 			Timeout:          timeout,
 			SNI:              cfg.SNI,
 			SpeedBytes:       speedSampleForMode(mode),
-			RequireWebSocket: mode == prober.ModeHTTP && speedSampleForMode(mode) > 0,
+			RequireWebSocket: mode == prober.ModeHTTP && cfg.RequireWS,
 		},
 	}
 	eng := engine.New(engCfg)
@@ -290,6 +290,7 @@ func runConfigPhase1(opts configPhase1Options) {
 			return
 		}
 	}
+	probeCfg.RequireWebSocket = opts.requireWS
 	ports := opts.ports
 	if len(ports) == 0 {
 		ports = []int{probeCfg.Port}
@@ -400,7 +401,7 @@ func runConfigPortProbesWithProbe(ctx context.Context, ips <-chan net.IP, ports 
 	neighborsQueued := 0
 
 	jobKey := func(ip net.IP, port int) string {
-		return fmt.Sprintf("%s:%d", ip.String(), port)
+		return net.JoinHostPort(ip.String(), strconv.Itoa(port))
 	}
 
 	submit := func(ip net.IP, port int) bool {
@@ -638,7 +639,17 @@ func loadIPs(path string) ([]net.IP, error) {
 			}
 		}
 	}
-	return ips, sc.Err()
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+
+	// Shuffle loaded IPs to ensure random order and prevent sequential scanning bias
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng.Shuffle(len(ips), func(i, j int) {
+		ips[i], ips[j] = ips[j], ips[i]
+	})
+
+	return ips, nil
 }
 
 func sampleFromSubnet(ipNet *net.IPNet, count int) []net.IP {

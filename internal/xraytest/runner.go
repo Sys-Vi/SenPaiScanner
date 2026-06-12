@@ -10,6 +10,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -217,7 +218,7 @@ func traceTargetsForConfig(cfg *VLESSConfig) []traceTarget {
 			if port == 80 {
 				scheme = "http"
 			}
-			add(fmt.Sprintf("%s://%s:%d/cdn-cgi/trace", scheme, cfg.Address, port), host)
+			add(fmt.Sprintf("%s://%s/cdn-cgi/trace", scheme, net.JoinHostPort(cfg.Address, strconv.Itoa(port))), host)
 			add(fmt.Sprintf("%s://%s:%d/cdn-cgi/trace", scheme, host, port), "")
 		}
 	}
@@ -255,7 +256,7 @@ func tunnelPathTargets(cfg *VLESSConfig) []traceTarget {
 		scheme = "http"
 	}
 	return []traceTarget{{
-		url:  fmt.Sprintf("%s://%s:%d%s", scheme, cfg.Address, port, path),
+		url:  fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(cfg.Address, strconv.Itoa(port)), path),
 		host: host,
 	}}
 }
@@ -496,15 +497,11 @@ type speedTarget struct {
 }
 
 func speedBudget(total, spent time.Duration) time.Duration {
-	budget := 4 * time.Second
 	remaining := total - spent
-	if remaining < budget {
-		budget = remaining
-	}
-	if budget < time.Second {
+	if remaining < time.Second {
 		return time.Second
 	}
-	return budget
+	return remaining
 }
 
 func measureProxySpeed(ctx context.Context, proxyAddr string, cfg *VLESSConfig) (int64, float64) {
@@ -579,7 +576,7 @@ func speedTestTargets(cfg *VLESSConfig, sampleBytes int64) []speedTarget {
 					path = "/" + path
 				}
 				if cfg.Address != "" {
-					ipURL := fmt.Sprintf("%s://%s:%d%s", scheme, cfg.Address, port, path)
+					ipURL := fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(cfg.Address, strconv.Itoa(port)), path)
 					if _, ok := seen[ipURL]; !ok {
 						seen[ipURL] = struct{}{}
 						targets = append(targets, speedTarget{

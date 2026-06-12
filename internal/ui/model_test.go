@@ -455,3 +455,47 @@ func TestPhase1TargetTotalEnforcesCountLimit(t *testing.T) {
 		t.Errorf("expected target total to be 10, got %d", total)
 	}
 }
+
+func TestConfigOptionalCtrlXClearsInput(t *testing.T) {
+	m := newTestApp(t)
+	m.configInput.SetValue("vless://test-url-to-clear")
+	m.page = PageConfigOptional
+	m.configOptionalRow = 0
+
+	// Simulate pressing ctrl+x
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	m2 := res.(AppModel)
+	if m2.configInput.Value() != "" {
+		t.Fatalf("expected configInput to be cleared, got %q", m2.configInput.Value())
+	}
+
+	// Also test speed URL input clear
+	m2.configSpeedURLInput.SetValue("http://test-speed-url")
+	m2.configOptionalRow = 3
+
+	res2, _ := m2.Update(tea.KeyMsg{Type: tea.KeyCtrlX})
+	m3 := res2.(AppModel)
+	if m3.configSpeedURLInput.Value() != "" {
+		t.Fatalf("expected configSpeedURLInput to be cleared, got %q", m3.configSpeedURLInput.Value())
+	}
+}
+
+func TestScanConfigF4TogglesRequireWS(t *testing.T) {
+	m := newTestApp(t)
+	m.page = PageScanConfig
+	m.scanCfg.RequireWS = true
+
+	// Simulate pressing f4
+	res, _ := m.Update(tea.KeyMsg{Type: tea.KeyF4})
+	m2 := res.(AppModel)
+	if m2.scanCfg.RequireWS {
+		t.Error("expected RequireWS to be false after pressing f4")
+	}
+
+	// Simulate pressing f4 again
+	res2, _ := m2.Update(tea.KeyMsg{Type: tea.KeyF4})
+	m3 := res2.(AppModel)
+	if !m3.scanCfg.RequireWS {
+		t.Error("expected RequireWS to be true after pressing f4 again")
+	}
+}

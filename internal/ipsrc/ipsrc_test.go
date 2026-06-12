@@ -150,3 +150,32 @@ func TestNewWithOptionsCIDROnly(t *testing.T) {
 		t.Fatalf("expected no v6 CIDRs, got %d", len(s.v6Nets))
 	}
 }
+
+func TestWeightedRandomIPv4Selection(t *testing.T) {
+	// Create a source with two CIDR ranges of vastly different sizes:
+	// A: 192.0.2.0/24 (256 IPs)
+	// B: 198.51.100.0/30 (4 IPs)
+	s, err := NewWithOptions(true, false, []string{"192.0.2.0/24", "198.51.100.0/30"}, Options{UseBuiltin: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Total IPv4 size is 256 + 4 = 260.
+	// Subnet A (192.0.2.0/24) has size 256. Probability is 256/260 = 98.46%.
+	// Subnet B (198.51.100.0/30) has size 4. Probability is 4/260 = 1.54%.
+	// We run 1000 random selections and check that Subnet A is chosen significantly more than Subnet B.
+	countA := 0
+	countB := 0
+	for i := 0; i < 1000; i++ {
+		ip := s.Random()
+		if ip.To4() != nil && ip.To4()[0] == 192 {
+			countA++
+		} else if ip.To4() != nil && ip.To4()[0] == 198 {
+			countB++
+		}
+	}
+
+	if countA < 900 {
+		t.Errorf("expected Subnet A to be chosen around 98%% of the time, got A=%d, B=%d", countA, countB)
+	}
+}

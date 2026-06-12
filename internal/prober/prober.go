@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -151,7 +152,7 @@ func Probe(ctx context.Context, ip net.IP, cfg Config) *result.Result {
 
 // probeTCP measures a raw TCP connect time.
 func probeTCP(ctx context.Context, ip net.IP, port int, timeout time.Duration) time.Duration {
-	addr := fmt.Sprintf("%s:%d", ip.String(), port)
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(port))
 	dl := time.Now().Add(timeout)
 	dialCtx, cancel := context.WithDeadline(ctx, dl)
 	defer cancel()
@@ -169,7 +170,7 @@ func probeTCP(ctx context.Context, ip net.IP, port int, timeout time.Duration) t
 
 // probeTLS measures a TLS handshake time.
 func probeTLS(ctx context.Context, ip net.IP, port int, sni string, timeout time.Duration, insecure bool) (time.Duration, bool) {
-	addr := fmt.Sprintf("%s:%d", ip.String(), port)
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(port))
 	dl := time.Now().Add(timeout)
 	dialCtx, cancel := context.WithDeadline(ctx, dl)
 	defer cancel()
@@ -253,7 +254,10 @@ func probeHTTP(ctx context.Context, ip net.IP, port int, sni string, timeout tim
 func probeTrace(ctx context.Context, ip net.IP, port int, host string, timeout time.Duration, insecure bool) (
 	lat time.Duration, tlsOk bool, httpStatus int, colo string,
 ) {
-	addr := fmt.Sprintf("%s:%d", ip.String(), port)
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(port))
+
+	dialTimeout := max(timeout/4, min(2*time.Second, timeout))
+	handshakeTimeout := max(timeout/2, min(3*time.Second, timeout))
 
 	// Budget split: TCP gets ¼, TLS gets ½, leaving ¼ guaranteed for the HTTP
 	// GET+response. Without this, on DPI-throttled networks the TLS handshake
@@ -261,7 +265,7 @@ func probeTrace(ctx context.Context, ip net.IP, port int, host string, timeout t
 	// phase impossible and producing false-positive packet loss.
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: timeout / 4}).DialContext(ctx, network, addr)
+			return (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, network, addr)
 		},
 		TLSClientConfig: &tls.Config{
 			ServerName:         host,
@@ -269,7 +273,7 @@ func probeTrace(ctx context.Context, ip net.IP, port int, host string, timeout t
 			InsecureSkipVerify: insecure,
 		},
 		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: timeout / 2,
+		TLSHandshakeTimeout: handshakeTimeout,
 	}
 
 	client := &http.Client{
@@ -331,13 +335,14 @@ func probeWebSocket(ctx context.Context, ip net.IP, port int, sni, host, path st
 	defer cancel()
 	deadline, _ := wsCtx.Deadline()
 
-	addr := fmt.Sprintf("%s:%d", ip.String(), port)
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(port))
 	if host == "" {
 		host = sni
 	}
 	path = normalizeWSPath(path)
 
-	dialer := &net.Dialer{Timeout: timeout / 3}
+	wsDialTimeout := max(timeout/3, min(2*time.Second, timeout))
+	dialer := &net.Dialer{Timeout: wsDialTimeout}
 	conn, err := dialer.DialContext(wsCtx, "tcp", addr)
 	if err != nil {
 		return false
@@ -445,10 +450,13 @@ func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Durati
 		return 0
 	}
 
-	addr := fmt.Sprintf("%s:%d", ip.String(), port)
+	addr := net.JoinHostPort(ip.String(), strconv.Itoa(port))
+	dialTimeout := max(timeout/4, min(2*time.Second, timeout))
+	handshakeTimeout := max(timeout/2, min(3*time.Second, timeout))
+
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: timeout / 4}).DialContext(ctx, network, addr)
+			return (&net.Dialer{Timeout: dialTimeout}).DialContext(ctx, network, addr)
 		},
 		TLSClientConfig: &tls.Config{
 			ServerName:         "speed.cloudflare.com",
@@ -456,7 +464,7 @@ func probeDownload(ctx context.Context, ip net.IP, port int, timeout time.Durati
 			InsecureSkipVerify: insecure,
 		},
 		DisableKeepAlives:   true,
-		TLSHandshakeTimeout: timeout / 2,
+		TLSHandshakeTimeout: handshakeTimeout,
 	}
 	client := &http.Client{Timeout: timeout, Transport: transport}
 

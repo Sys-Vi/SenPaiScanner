@@ -48,11 +48,9 @@ func TestTraceTargetsPreferConfigIP(t *testing.T) {
 
 func TestSpeedBudgetReservesTimeForSpeedTest(t *testing.T) {
 	got := speedBudget(22*time.Second, 900*time.Millisecond)
-	if got < 4*time.Second {
-		t.Fatalf("budget = %s, want at least 4s", got)
-	}
-	if got > 6*time.Second {
-		t.Fatalf("budget = %s, want at most ~4s", got)
+	want := 21100 * time.Millisecond
+	if got != want {
+		t.Fatalf("budget = %s, want %s", got, want)
 	}
 }
 

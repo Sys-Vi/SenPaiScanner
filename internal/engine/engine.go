@@ -57,6 +57,7 @@ func (e *Engine) Stats() *Stats {
 }
 
 // Run consumes IPs from src, probes each one, and forwards results to fn.
+// Run consumes IPs from src, probes each one, and forwards results to fn.
 // It blocks until src is exhausted or ctx is cancelled.
 func (e *Engine) Run(ctx context.Context, src <-chan net.IP, fn ResultFunc) {
 	sem := make(chan struct{}, e.cfg.Concurrency)
@@ -67,39 +68,47 @@ func (e *Engine) Run(ctx context.Context, src <-chan net.IP, fn ResultFunc) {
 		case <-ctx.Done():
 			wg.Wait()
 			return
-		case ip, ok := <-src:
-			if !ok {
+		case sem <- struct{}{}:
+			select {
+			case <-ctx.Done():
+				<-sem
 				wg.Wait()
 				return
-			}
-
-			if e.limiter != nil {
-				if err := e.limiter.Wait(ctx); err != nil {
+			case ip, ok := <-src:
+				if !ok {
+					<-sem
 					wg.Wait()
 					return
 				}
-			}
 
-			sem <- struct{}{}
-			e.stats.InFlight.Add(1)
-			wg.Add(1)
-
-			go func(ip net.IP) {
-				defer func() {
-					<-sem
-					e.stats.InFlight.Add(-1)
-					wg.Done()
-				}()
-
-				r := prober.Probe(ctx, ip, e.cfg.ProbeConfig)
-				e.stats.Tested.Add(1)
-				if r.IsHealthy() {
-					e.stats.Healthy.Add(1)
-				} else {
-					e.stats.Failed.Add(1)
+				if e.limiter != nil {
+					if err := e.limiter.Wait(ctx); err != nil {
+						<-sem
+						wg.Wait()
+						return
+					}
 				}
-				fn(r)
-			}(ip)
+
+				e.stats.InFlight.Add(1)
+				wg.Add(1)
+
+				go func(ip net.IP) {
+					defer func() {
+						<-sem
+						e.stats.InFlight.Add(-1)
+						wg.Done()
+					}()
+
+					r := prober.Probe(ctx, ip, e.cfg.ProbeConfig)
+					e.stats.Tested.Add(1)
+					if r.IsHealthy() {
+						e.stats.Healthy.Add(1)
+					} else {
+						e.stats.Failed.Add(1)
+					}
+					fn(r)
+				}(ip)
+			}
 		}
 	}
 }

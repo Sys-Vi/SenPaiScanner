@@ -118,6 +118,7 @@ type ScanConfig struct {
 	SNI         string
 	UseV4       bool
 	UseV6       bool
+	RequireWS   bool
 }
 
 func defaultScanConfig() ScanConfig {
@@ -130,6 +131,7 @@ func defaultScanConfig() ScanConfig {
 		Mode:        config.ScanDefaults.Mode,
 		UseV4:       config.ScanDefaults.UseV4,
 		UseV6:       config.ScanDefaults.UseV6,
+		RequireWS:   true,
 	}
 }
 
@@ -285,6 +287,8 @@ const (
 
 var modes = []string{"tls", "tcp", "http"}
 
+const phase2WorkersCount = 10
+
 // SavedConfig represents the scan settings that can be persisted.
 type SavedConfig struct {
 	IPMode          int    `json:"ip_mode"`
@@ -303,6 +307,7 @@ type SavedConfig struct {
 	SpeedURL        string `json:"speed_url"`
 	SpeedSizeIdx    int    `json:"speed_size_idx"`
 	SpeedSizeCustom string `json:"speed_size_custom"`
+	RequireWS       bool   `json:"require_ws"`
 }
 
 // AppConfig wraps SavedConfig to allow for future settings.
@@ -331,7 +336,7 @@ func loadAppConfig() AppConfig {
 	if err != nil {
 		return defaultAppConfig()
 	}
-	var cfg AppConfig
+	cfg := defaultAppConfig()
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return defaultAppConfig()
 	}
@@ -366,6 +371,7 @@ func defaultAppConfig() AppConfig {
 			SpeedURL:        "",
 			SpeedSizeIdx:    1, // 512 KB
 			SpeedSizeCustom: "",
+			RequireWS:       true,
 		},
 	}
 }
@@ -393,6 +399,7 @@ func (m *AppModel) applySavedConfig(cfg SavedConfig) {
 		m.configSelectedPorts[0] = true
 	}
 	m.configInput.SetValue(cfg.ConfigURL)
+	m.scanCfg.RequireWS = cfg.RequireWS
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +419,7 @@ func NewApp(version string) AppModel {
 	speedURLInput := textinput.New()
 	speedURLInput.Placeholder = "empty = default (speed.cloudflare.com)"
 	speedURLInput.CharLimit = 500
-	speedURLInput.Width = 0
+	speedURLInput.Width = 60
 
 	m := AppModel{
 		page:                PageHome,
@@ -430,7 +437,7 @@ func NewApp(version string) AppModel {
 	cfgInput := textinput.New()
 	cfgInput.Placeholder = "vless://, trojan://, or vmess:// share URL"
 	cfgInput.CharLimit = 2000
-	cfgInput.Width = 0 // 0 = no fixed width, grows with content
+	cfgInput.Width = 60
 	m.configInput = cfgInput
 
 	cfgCustom := textinput.New()
@@ -971,6 +978,8 @@ func (m AppModel) handleConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.scanCfg.UseV4 = !m.scanCfg.UseV4
 	case "f3":
 		m.scanCfg.UseV6 = !m.scanCfg.UseV6
+	case "f4":
+		m.scanCfg.RequireWS = !m.scanCfg.RequireWS
 	case "enter":
 		m.saveScanConfig()
 		m.activeScanID = nextScanID()
@@ -1152,7 +1161,7 @@ func writeIPsBesideExecutable(ips []string) (string, error) {
 			dir = "."
 		}
 	}
-	path := filepath.Join(dir, "ips.txt")
+	path := filepath.Join(dir, "working_ips.txt")
 	if err := writeIPsFile(path, ips); err == nil {
 		return path, nil
 	}
@@ -1161,7 +1170,7 @@ func writeIPsBesideExecutable(ips []string) (string, error) {
 	if wdErr != nil {
 		return path, wdErr
 	}
-	fallback := filepath.Join(wd, "ips.txt")
+	fallback := filepath.Join(wd, "working_ips.txt")
 	if fallback == path {
 		err := writeIPsFile(fallback, ips)
 		return fallback, err
@@ -1467,8 +1476,20 @@ func (m AppModel) viewScanConfig() string {
 	sb.WriteString(fmt.Sprintf("%s%s%s\n", styleHeader.Render("  IPv4         "), v4s, styleDim.Render("  F2 toggle")))
 	sb.WriteString(fmt.Sprintf("%s%s%s\n", styleHeader.Render("  IPv6         "), v6s, styleDim.Render("  F3 toggle")))
 
+	if m.scanCfg.Mode == "http" {
+		wss := styleGood.Render("ON")
+		if !m.scanCfg.RequireWS {
+			wss = styleBad.Render("OFF")
+		}
+		sb.WriteString(fmt.Sprintf("%s%s%s\n", styleHeader.Render("  WebSocket    "), wss, styleDim.Render("  F4 toggle (Require WebSocket)")))
+	}
+
 	sb.WriteRune('\n')
-	sb.WriteString(styleHint.Render("  tab/↑↓ navigate   enter start scan   esc back"))
+	hint := "  tab/↑↓ navigate   enter start scan   esc back"
+	if m.scanCfg.Mode == "http" {
+		hint += "   f4 toggle ws"
+	}
+	sb.WriteString(styleHint.Render(hint))
 	sb.WriteRune('\n')
 
 	return sb.String()
@@ -1999,6 +2020,16 @@ func (m AppModel) viewScanWithConfig() string {
 		sb.WriteString("\n")
 		sb.WriteString(styleDim.Render("            space toggles a port; selecting multiple ports multiplies work") + "\n\n")
 
+		// Row 5: WebSocket
+		rowLabel(5, "  WebSocket")
+		sb.WriteString(" ")
+		wss := styleGood.Render("ON")
+		if !m.scanCfg.RequireWS {
+			wss = styleBad.Render("OFF")
+		}
+		sb.WriteString(wss + "\n")
+		sb.WriteString(styleDim.Render("            require a successful WebSocket check in Phase 1 (f4/arrows toggle)") + "\n\n")
+
 		hint := "  ↑/↓ row   ←/→ option   enter continue   esc back"
 		if m.configCustomMode {
 			hint = "  type value   enter confirm   esc cancel"
@@ -2050,8 +2081,9 @@ func (m AppModel) viewScanWithConfig() string {
 		progBar,
 	))
 	if !m.configDone {
-		sb.WriteString(fmt.Sprintf("  %s  xray validating candidates  %s\n\n",
+		sb.WriteString(fmt.Sprintf("  %s  xray validating candidates (%d workers)  %s\n\n",
 			styleAccent.Render(scanPulse(m.bannerFrame)),
+			phase2WorkersCount,
 			scanWave(m.bannerFrame+5, 32),
 		))
 	}
@@ -2186,8 +2218,8 @@ func (m AppModel) handleScanWithConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// --- Setup navigation (Source → Count → Workers → Timeout → Ports) ---
-	const maxRow = 4
+	// --- Setup navigation (Source → Count → Workers → Timeout → Ports → WebSocket) ---
+	const maxRow = 5
 
 	configNavLeft := func() {
 		switch m.configSetupRow {
@@ -2211,6 +2243,8 @@ func (m AppModel) handleScanWithConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.configPortFocus > 0 {
 				m.configPortFocus--
 			}
+		case 5:
+			m.scanCfg.RequireWS = !m.scanCfg.RequireWS
 		}
 	}
 	configNavRight := func() {
@@ -2235,6 +2269,8 @@ func (m AppModel) handleScanWithConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.configPortFocus < len(configPortChoices)-1 {
 				m.configPortFocus++
 			}
+		case 5:
+			m.scanCfg.RequireWS = !m.scanCfg.RequireWS
 		}
 	}
 
@@ -2256,9 +2292,16 @@ func (m AppModel) handleScanWithConfigKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			configNavRight()
 		}
 		return m, nil
+	case "f4":
+		m.scanCfg.RequireWS = !m.scanCfg.RequireWS
+		return m, nil
 	case " ":
 		if m.configSetupRow == 4 {
 			m.toggleFocusedConfigPort()
+			return m, nil
+		}
+		if m.configSetupRow == 5 {
+			m.scanCfg.RequireWS = !m.scanCfg.RequireWS
 			return m, nil
 		}
 	case "enter":
@@ -2377,9 +2420,9 @@ func (m AppModel) viewConfigOptional() string {
 
 	hint := "  ↑/↓ row   ←/→ option   enter select/confirm   esc back"
 	if m.configOptionalRow == 0 {
-		hint = "  paste URL or leave empty   enter confirm/navigate   ↓ navigate   esc back"
+		hint = "  paste URL, ctrl+x clear   enter confirm/navigate   ↓ navigate   esc back"
 	} else if m.configOptionalRow == 3 {
-		hint = "  type custom download URL   enter confirm/navigate   esc back"
+		hint = "  type custom download URL, ctrl+x clear   enter confirm/navigate   esc back"
 	}
 	if m.configCustomMode {
 		hint = "  type value   enter confirm   esc cancel"
@@ -2468,6 +2511,15 @@ func (m AppModel) handleConfigOptionalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.configOptionalRow == 3 {
 				m.configOptionalRow = 4
 				m.configSpeedURLInput.Blur()
+				return m, nil
+			}
+
+		case "ctrl+x":
+			if m.configOptionalRow == 0 {
+				m.configInput.SetValue("")
+				return m, nil
+			} else if m.configOptionalRow == 3 {
+				m.configSpeedURLInput.SetValue("")
 				return m, nil
 			}
 		}
@@ -2643,6 +2695,7 @@ func (m AppModel) launchPhase1FromOptional() (AppModel, tea.Cmd) {
 		SpeedURL:        strings.TrimSpace(m.configSpeedURLInput.Value()),
 		SpeedSizeIdx:    m.configSpeedSizeIdx,
 		SpeedSizeCustom: m.configSpeedSizeCustom,
+		RequireWS:       m.scanCfg.RequireWS,
 	}
 	for port, on := range m.configSelectedPorts {
 		if on {
@@ -3027,6 +3080,7 @@ type configPhase1Options struct {
 	rawURL      string
 	ports       []int
 	fromFile    bool
+	requireWS   bool
 }
 
 func (m AppModel) startConfigPhase1() tea.Cmd {
@@ -3035,6 +3089,22 @@ func (m AppModel) startConfigPhase1() tea.Cmd {
 		go runConfigPhase1(opts)
 		return nil
 	}
+}
+
+func (m AppModel) resolveTimeout() time.Duration {
+	var timeout time.Duration
+	if m.configTimeoutIdx < len(quickTimeoutPresets) {
+		tp := quickTimeoutPresets[m.configTimeoutIdx]
+		if tp.value != "" {
+			timeout, _ = time.ParseDuration(tp.value)
+		} else {
+			timeout, _ = time.ParseDuration(m.configTimeoutCustom)
+		}
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	return timeout
 }
 
 // resolvePhase1Options reads the current picker state and returns concrete values
@@ -3062,26 +3132,14 @@ func (m AppModel) resolvePhase1Options() configPhase1Options {
 		concurrency = 50
 	}
 
-	var timeout time.Duration
-	if m.configTimeoutIdx < len(quickTimeoutPresets) {
-		tp := quickTimeoutPresets[m.configTimeoutIdx]
-		if tp.value != "" {
-			timeout, _ = time.ParseDuration(tp.value)
-		} else {
-			timeout, _ = time.ParseDuration(m.configTimeoutCustom)
-		}
-	}
-	if timeout <= 0 {
-		timeout = 5 * time.Second
-	}
-
 	return configPhase1Options{
 		count:       count,
 		concurrency: concurrency,
-		timeout:     timeout,
+		timeout:     m.resolveTimeout(),
 		rawURL:      m.configURL,
 		ports:       m.resolveConfigPorts(),
 		fromFile:    m.configIPMode == 1,
+		requireWS:   m.scanCfg.RequireWS,
 	}
 }
 
@@ -3132,13 +3190,42 @@ func (m AppModel) startConfigPhase2(topIPs []*result.Result) tea.Cmd {
 	minSpeed := m.resolveMinSpeed()
 	speedURL := strings.TrimSpace(m.configSpeedURLInput.Value())
 	speedSize := m.resolveSpeedSize()
+	timeout := m.resolveTimeout()
+
+	// Xray validation has startup and SOCKS proxy overheads.
+	// We enforce a minimum floor of 10s and scale with the user timeout.
+	xrayTimeout := timeout * 2
+	if xrayTimeout < 10*time.Second {
+		xrayTimeout = 10 * time.Second
+	}
+
+	// Add dynamic budget for speed testing if a speed check is requested/configured.
+	// We calculate how long a download is expected to take at the user's minSpeed
+	// threshold (in Mbps) or a default of 1 Mbps.
+	speedBits := speedSize * 8
+	effectiveMinSpeed := minSpeed
+	if effectiveMinSpeed <= 0 {
+		effectiveMinSpeed = 1.0 // 1 Mbps default for estimation
+	}
+	expectedSpeedSec := float64(speedBits) / (effectiveMinSpeed * 1_000_000)
+	// Give a 3x buffer to allow slow/flaky but working connections to finish the test,
+	// with a minimum floor of 5s and ceiling of 30s.
+	speedLimit := time.Duration(expectedSpeedSec * 3 * float64(time.Second))
+	if speedLimit < 5*time.Second {
+		speedLimit = 5 * time.Second
+	}
+	if speedLimit > 30*time.Second {
+		speedLimit = 30 * time.Second
+	}
+	xrayTimeout += speedLimit
+
 	return func() tea.Msg {
-		go runConfigPhase2(url, topIPs, minSpeed, speedURL, speedSize)
+		go runConfigPhase2(url, topIPs, minSpeed, speedURL, speedSize, xrayTimeout)
 		return nil
 	}
 }
 
-func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, speedURL string, speedSize int64) {
+func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, speedURL string, speedSize int64, timeout time.Duration) {
 	cfg, err := xraytest.ParseProxyURL(rawURL)
 	if err != nil {
 		if prog != nil {
@@ -3177,8 +3264,7 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, s
 		return
 	}
 
-	const phase2Workers = 3
-	sem := make(chan struct{}, phase2Workers)
+	sem := make(chan struct{}, phase2WorkersCount)
 	var wg sync.WaitGroup
 	var done atomic.Int32
 
@@ -3193,7 +3279,7 @@ func runConfigPhase2(rawURL string, topIPs []*result.Result, minSpeed float64, s
 			swapped := cfg.WithEndpoint(r.IP.String(), r.Port)
 			swapped.SpeedURL = speedURL
 			swapped.SpeedSize = speedSize
-			vr := xraytest.ValidateConfig(ctx, swapped, 22*time.Second)
+			vr := xraytest.ValidateConfig(ctx, swapped, timeout)
 			if vr.Success && minSpeed > 0 {
 				mbps := vr.Throughput * 8 / 1_000_000
 				if mbps < minSpeed {
